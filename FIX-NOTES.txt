@@ -18,3 +18,19 @@ Eye-track left-side fix 2026-10-06:
 Denser mouth frames 2026-10-06:
 - Baked o0–o15 (16 tiers, was o0–o7 / 8) per head yaw; manifest v4.
 - SpriteDriver jawBounds 15 thresholds + jawHys 0.015; jawClosedMax 0.06 + no mouth crossfade kept.
+
+Liveliness 2026-10-06 (SpriteDriver / AnimeFaceView; LipSyncEngine.speakingUnlocked now private(set)):
+1) Natural blink: SpriteDriver owns a human rhythm (2–6 s idle, 2–5 s while active), ease-in close
+   75 ms / hold 45 ms / ease-out open 170 ms → blink1→blink2→blink3→closed→back; ~12% double, ~10% partial.
+   Max-blended with LipSyncEngine.eyeBlink (FaceTracker has no blink signal); external blinks within
+   1.2 s of ours are ignored and accepted ones reschedule ours (no double-rate flutter).
+2) Head sway while active (speakingUnlocked || energy > 0.022): two-sine yaw added to HEAD yaw only
+   (eyes keep tracker + ViewerParallax gaze), peaks can tip center↔left1/right1; pitch bob + roll +
+   tiny jaw-coupled dip rendered as a transform of the whole stack (mouth moves with head, no ghosting).
+3) Idle sway: <2.5 s after audio stops amp 0.55 / rate 0.6; then eases to mild idle amp 0.32 / rate 0.4
+   (never freezes). Phase accumulators → no jumps when rate changes.
+4) Thinking: rising edge of activity after ≥0.9 s quiet (cooldown 2.5 s) → 90 ms blink1 lid dip, then
+   eyes up2/up1/left2/right2 for 0.45–0.75 s with small head bias/lift, then tracking resumes
+   (35% chance of a blink on the gaze return). Blink keeps priority over thinking.
+Unchanged: o0–o15 jaw tiers/jawBounds, jawClosedMax o0 clamp, no mouth crossfade, FaceTracker hold,
+ScreenCaptureKit live path, ViewerParallax.

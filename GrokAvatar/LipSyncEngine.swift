@@ -53,7 +53,8 @@ final class LipSyncEngine: ObservableObject {
     private let noiseFloorRatio: Float = 3.5
 
     private var aboveGateFrames: Int = 0
-    private var speakingUnlocked = false
+    /// Read-only for SpriteDriver liveliness (head sway / thinking onset). Not @Published (60 Hz).
+    private(set) var speakingUnlocked = false
 
     private var nextBlinkAt = Date().addingTimeInterval(2.5)
     private var blinkPhase: Float = 0
