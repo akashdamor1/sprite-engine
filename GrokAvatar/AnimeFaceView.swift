@@ -7,10 +7,10 @@ import QuartzCore
 
 /// Loads the baked VN sprite layers (Models/sprites → app Resources/sprites) once, fully decoded.
 ///
-/// v3 extra-dense set (canvas 1024×1024, crops positioned by `sprite_manifest.json` rects):
+/// v4 denser mouths (canvas 1024×1024, crops positioned by `sprite_manifest.json` rects):
 ///   head_{left3|left2|left1|center|right1|right2|right3}.png         opaque head bases (7)
 ///   eyes_{H}_{center|left1-3|right1-3|up1-3|down1-3|blink1-3|closed}.png  eye-band crops (7×17 = 119)
-///   mouth_{H}_{o0…o7}.png                                             mouth crops, 8 openness tiers (7×8 = 56)
+///   mouth_{H}_{o0…o15}.png                                            mouth crops, 16 openness tiers (7×16 = 112)
 final class SpriteBank {
     struct Sprite { let image: CGImage; let rect: CGRect }
 
@@ -107,7 +107,7 @@ final class SpriteDriver: ObservableObject {
     static let eyesX = ["left3", "left2", "left1", "center", "right1", "right2", "right3"]   // look level -3…+3
     static let eyesY = ["down3", "down2", "down1", "center", "up1", "up2", "up3"]            // pitch level -3…+3
     static let blinks = ["open", "blink1", "blink2", "blink3", "closed"]                       // lid 0 / 22 / 45 / 70 / 100 %
-    static let mouths = ["o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7"]                       // jaw tier 0…7
+    static let mouths = ["o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8", "o9", "o10", "o11", "o12", "o13", "o14", "o15"]  // jaw tier 0…15
     static let centerIdx = 3
 
     // Thresholds (boundaries between neighbouring levels) + hysteresis margin
@@ -115,8 +115,13 @@ final class SpriteDriver: ObservableObject {
     private static let lookBounds: [Float] = [-0.40, -0.24, -0.09, 0.09, 0.24, 0.40];  private static let lookHys: Float = 0.025
     private static let pitchBounds: [Float] = [-0.45, -0.28, -0.12, 0.12, 0.28, 0.45]; private static let pitchHys: Float = 0.03
     private static let blinkBounds: [Float] = [0.15, 0.38, 0.60, 0.82];                private static let blinkHys: Float = 0.03
-    // Quiet speech → o1–o2; mid o3–o4; loud o5–o7. High first tier so residual jaw never flaps o0.
-    private static let jawBounds: [Float] = [0.10, 0.18, 0.28, 0.38, 0.50, 0.62, 0.76]; private static let jawHys: Float = 0.025
+    // Quiet → early o1–o4; mid o5–o10; loud o11–o15. Finer steps + smaller hys for smoother lip motion.
+    // High first tier so residual jaw never flaps o0; jawClosedMax still hard-forces o0 when idle.
+    private static let jawBounds: [Float] = [
+        0.10, 0.15, 0.20, 0.25, 0.30, 0.36, 0.42, 0.48,
+        0.54, 0.60, 0.66, 0.72, 0.78, 0.85, 0.92
+    ]
+    private static let jawHys: Float = 0.015
     /// Absolute closed-mouth clamp — below this SpriteDriver forces o0 regardless of hysteresis.
     private static let jawClosedMax: Float = 0.06
 

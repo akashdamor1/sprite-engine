@@ -14,3 +14,7 @@ Lip-sync fix 2026-10-06b (still-talking after DEMO disable):
 Eye-track left-side fix 2026-10-06:
 - Cause: VNImageRequestHandler orientation .leftMirrored (iPhone portrait) on Mac landscape webcam dropped/skewed faces on one horizontal side; both-eyes-only landmark gate + zeroing on miss made left look freeze/decay while right stayed OK.
 - Fix: orientation .up; rectangles fallback; nose/box when one eye missing; hold last pose on miss; faceHold 0.55s. No blanket yaw negate (right already correct). Sprites/bounds were symmetric.
+
+Denser mouth frames 2026-10-06:
+- Baked o0–o15 (16 tiers, was o0–o7 / 8) per head yaw; manifest v4.
+- SpriteDriver jawBounds 15 thresholds + jawHys 0.015; jawClosedMax 0.06 + no mouth crossfade kept.

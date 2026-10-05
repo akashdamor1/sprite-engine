@@ -45,7 +45,7 @@ final class LipSyncEngine: ObservableObject {
     private let attack: Float = 0.22
     private let release: Float = 0.70
     private let quietRelease: Float = 0.88
-    /// Quiet speech → o1–o2; loud → o5–o7 (with SpriteDriver jawBounds).
+    /// Quiet speech → early o tiers; loud → upper o tiers (with SpriteDriver jawBounds o0…o15).
     private let jawGain: Float = 12.0
     /// Slow adaptive floor from quiet packets; speak must clear floor*ratio too.
     private var noiseFloor: Float = 0.004

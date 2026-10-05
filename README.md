@@ -61,7 +61,7 @@ Uses `swiftc` (no Xcode project). Target: `arm64-apple-macosx13.0`.
   - `head_{left3,left2,left1,center,right1,right2,right3}.png`: opaque 1024² head bases (7 yaw steps, 12 px slide per step)
   - `eyes_{H}_{E}.png`: eye-band crops (7×17 = 119)
     - E = center, left1-3 / right1-3 (iris 5/10/15 px), up1-3 / down1-3 (3/6/9 px), blink1/2/3 (lid 22/45/70 %), closed
-  - `mouth_{H}_o0..o7.png`: mouth crops, 8 openness tiers (7×8 = 56)
+  - `mouth_{H}_o0..o15.png`: mouth crops, 16 openness tiers (7×16 = 112)
   - The manifest gives each crop's `[x,y,w,h]` on the 1024 canvas.
 - Re-bake: `python3 tools/bake_sprites.py Models/anime-face.jpg Models/sprites` (numpy, opencv, scipy, pillow; about 50 s)
 - Selection (`SpriteDriver`, 60 Hz, level quantizers with hysteresis):
@@ -69,6 +69,6 @@ Uses `swiftc` (no Xcode project). Target: `arm64-apple-macosx13.0`.
   - yaw → eye look, ±0.09/±0.24/±0.40
   - pitch → up/down, ±0.12/±0.28/±0.45
   - eyeBlink → blink1/2/3/closed at 0.15/0.38/0.60/0.82
-  - jawOpen → o1…o7 at 0.04/0.10/0.16/0.23/0.30/0.38/0.47
+  - jawOpen → o1…o15 at finer bounds 0.10…0.92 (15 steps); jawOpen < 0.06 forces o0
   - Head and eye changes crossfade (30 ms for blinks, 50 ms for eye moves, 90 ms for head steps); the mouth snaps.
 - Older sets are backed up: v1 in `backup-pre-sprites-v2/sprites_v1`, v2 in `backup-pre-sprites-v3/sprites_v2`.

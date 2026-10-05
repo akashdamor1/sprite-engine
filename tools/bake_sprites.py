@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Bake VN-style sprite layers for GrokAvatar from Models/anime-face.jpg (v3, extra-dense set).
+"""Bake VN-style sprite layers for GrokAvatar from Models/anime-face.jpg (v4, denser mouths).
 
 Outputs (canvas 1024x1024; crops are positioned via sprite_manifest.json):
   head_{H}.png          opaque full head base (eyes center, painted smile)             7
   eyes_{H}_{E}.png      eye-band crop over the head base (feathered rect edges)   7x17=119
-  mouth_{H}_{M}.png     transparent mouth crop (covers smile + draws mouth)        7x8=56
+  mouth_{H}_{M}.png     transparent mouth crop (covers smile + draws mouth)       7x16=112
   sprite_manifest.json  {"canvas":1024, "rects": {name: [x,y,w,h]}, ...}
 H = left3,left2,left1,center,right1,right2,right3   (7 yaw steps, 12px feature slide per step)
 E = center, left1..3 / right1..3 (iris 5/10/15px), up1..3 / down1..3 (3/6/9px),
     blink1 (lid 22%), blink2 (45%), blink3 (70%), closed
-M = o0 (painted smile) .. o7 (wide open), 8 openness tiers
+M = o0 (painted smile) .. o15 (wide open), 16 openness tiers for smoother lip-sync
 Usage: python3 bake_sprites.py <src.jpg> <outdir>
 """
 import sys, os
@@ -277,6 +277,21 @@ def draw_open_mouth(width, top_sag, depth, tongue=0.0, teeth=0.0, line_w=3.2):
     ol = rgba_layer_draw(outline)
     return cav, inn, ol
 
+MOUTH_OPEN_TIERS = 15  # o1..o15 (plus o0 closed = 16 total)
+
+def open_mouth_params(i):
+    """Smooth openness curve for tier i in 1..MOUTH_OPEN_TIERS (matches old o1..o7 envelope)."""
+    t = i / float(MOUTH_OPEN_TIERS)  # 1/15 .. 1.0
+    # Slight ease-in on depth so early tiers stay subtle (quiet speech).
+    te = t ** 1.08
+    width = 32.0 + 40.0 * t
+    top_sag = 2.2 - 1.2 * t
+    depth = 4.0 + 41.0 * te
+    tongue = 0.0 if t < 0.38 else 0.8 * ((t - 0.38) / 0.62)
+    teeth = 0.0 if t < 0.58 else 1.0 * ((t - 0.58) / 0.42)
+    line_w = 2.55 + 0.85 * t
+    return dict(width=width, top_sag=top_sag, depth=depth, tongue=tongue, teeth=teeth, line_w=line_w)
+
 def mouth_layer(kind):
     """Return full-canvas RGBA float layer (0..1) for the given mouth (center head)."""
     cx, cy = MOUTH_C
@@ -284,18 +299,15 @@ def mouth_layer(kind):
         comp = img.copy()
         ext = (cx - 64, cy - 22, cx + 64, cy + 22)
     else:
-        params = {
-            'o1': dict(width=36, top_sag=2, depth=5, tongue=0.0, teeth=0.0, line_w=2.6),
-            'o2': dict(width=44, top_sag=2, depth=9, tongue=0.0, teeth=0.0, line_w=2.8),
-            'o3': dict(width=50, top_sag=2, depth=14, tongue=0.0, teeth=0.0, line_w=3.0),
-            'o4': dict(width=56, top_sag=2, depth=20, tongue=0.35, teeth=0.0, line_w=3.1),
-            'o5': dict(width=62, top_sag=1.8, depth=27, tongue=0.45, teeth=0.0, line_w=3.2),
-            'o6': dict(width=68, top_sag=1.5, depth=35, tongue=0.6, teeth=0.6, line_w=3.3),
-            'o7': dict(width=72, top_sag=1, depth=45, tongue=0.8, teeth=1.0, line_w=3.4),
-        }[kind]
+        i = int(kind[1:])
+        if i < 1 or i > MOUTH_OPEN_TIERS:
+            raise KeyError(kind)
+        params = open_mouth_params(i)
         cav, inn, ol = draw_open_mouth(**params)
         comp = over(over(over(mouthless.copy(), cav), inn), ol)
         ext = (cx - 66, cy - 24, cx + 66, cy + 24 + params['depth'])
+    # cv2.ellipse needs int center/axes (depth is float on denser tiers)
+    ext = tuple(int(round(v)) for v in ext)
     patch = np.zeros((H, W), np.uint8)
     ex = ((ext[0] + ext[2]) // 2, (ext[1] + ext[3]) // 2)
     cv2.ellipse(patch, ex, ((ext[2] - ext[0]) // 2, (ext[3] - ext[1]) // 2), 0, 0, 360, 1, -1)
@@ -353,7 +365,7 @@ for n, px in ((1, 3), (2, 6), (3, 9)):
 for n, fr in ((1, 0.22), (2, 0.45), (3, 0.70)):
     EYES[f'blink{n}'] = (lambda f: (lambda: eyes_half(f)))(fr)
 EYES['closed'] = eyes_closed
-MOUTHS = [f'o{i}' for i in range(8)]
+MOUTHS = [f'o{i}' for i in range(MOUTH_OPEN_TIERS + 1)]
 HEADS = {'left3': -1.0, 'left2': -2 / 3, 'left1': -1 / 3, 'center': 0.0,
          'right1': 1 / 3, 'right2': 2 / 3, 'right3': 1.0}
 
@@ -388,7 +400,7 @@ if __name__ == '__main__':
             fn = f'mouth_{hname}_{mname}.png'
             save_rgba_arr(l[my0:my1, mx0:mx1], fn); files.append(fn)
             rects[fn[:-4]] = [mx0, my0, mx1 - mx0, my1 - my0]
-    manifest = dict(canvas=W, version=3, heads=list(HEADS), eyes=list(EYES), mouths=MOUTHS, rects=rects)
+    manifest = dict(canvas=W, version=4, heads=list(HEADS), eyes=list(EYES), mouths=MOUTHS, rects=rects)
     json.dump(manifest, open(os.path.join(OUT, 'sprite_manifest.json'), 'w'), indent=1)
     print('\n'.join(files))
     print(len(files), 'png files')
