@@ -23,7 +23,10 @@ final class FaceTracker: NSObject, ObservableObject {
     private var smoothPitch: Float = 0
     private let ema: Float = 0.45
     private var lastFaceAt: CFTimeInterval = 0
-    private let faceHoldSeconds: CFTimeInterval = 0.35
+    /// Hold last pose longer so brief left-edge Vision misses don't snap eyes to idle.
+    private let faceHoldSeconds: CFTimeInterval = 0.55
+    private var lastRawYaw: Float = 0
+    private var lastRawPitch: Float = 0
 
     func start() {
         guard !started else { return }
@@ -36,6 +39,8 @@ final class FaceTracker: NSObject, ObservableObject {
         smoothYaw = 0
         smoothPitch = 0
         lastFaceAt = 0
+        lastRawYaw = 0
+        lastRawPitch = 0
         sessionQueue.async { [weak self] in
             guard let self else { return }
             if self.session.isRunning {
@@ -202,19 +207,33 @@ extension FaceTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
     ) {
         guard started, authorizedLocal else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            publish(face: false, rawYaw: 0, rawPitch: 0)
+            // Keep last pose — do not zero (zeros were decaying left looks on dropped frames).
+            publish(face: false, rawYaw: lastRawYaw, rawPitch: lastRawPitch)
             return
         }
 
-        let request = VNDetectFaceLandmarksRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .leftMirrored, options: [:])
+        // MacBook webcam buffers are upright landscape. `.leftMirrored` is an iPhone
+        // portrait EXIF; it skewed Vision's coordinate map and dropped faces more often
+        // on one horizontal side (user: right OK, left fails). Use `.up`.
+        let landmarksReq = VNDetectFaceLandmarksRequest()
+        let rectsReq = VNDetectFaceRectanglesRequest()
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
-            try handler.perform([request])
-            guard let faces = request.results as? [VNFaceObservation], let face = faces.first else {
-                publish(face: false, rawYaw: 0, rawPitch: 0)
+            try handler.perform([landmarksReq, rectsReq])
+            let landmarkFaces = landmarksReq.results ?? []
+            let rectFaces = rectsReq.results ?? []
+            // Prefer landmarks obs; fall back to rectangles so left-edge faces still track.
+            let faces = landmarkFaces.isEmpty ? rectFaces : landmarkFaces
+            guard let face = faces.max(by: { $0.confidence < $1.confidence }) else {
+                publish(face: false, rawYaw: lastRawYaw, rawPitch: lastRawPitch)
                 return
             }
             let box = face.boundingBox
+            // Ignore tiny / garbage boxes (often appear when face is half off left/right).
+            guard box.width >= 0.04, box.height >= 0.04 else {
+                publish(face: false, rawYaw: lastRawYaw, rawPitch: lastRawPitch)
+                return
+            }
             var midX = Float(box.midX)
             var midY = Float(box.midY)
             if let lm = face.landmarks {
@@ -225,19 +244,30 @@ extension FaceTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
                     let n = CGFloat(pts.count)
                     return CGPoint(x: sx / n, y: sy / n)
                 }
-                if let l = centroid(lm.leftEye), let r = centroid(lm.rightEye) {
-                    // Landmark points are in face-normalized space
+                // Prefer both eyes; else nose. If only one eye survives at the left
+                // frame edge, keep boundingBox mid (single-eye centroid biases yaw).
+                let l = centroid(lm.leftEye)
+                let r = centroid(lm.rightEye)
+                let nose = centroid(lm.noseCrest) ?? centroid(lm.nose)
+                if let l, let r {
                     midX = Float(box.minX) + Float((l.x + r.x) * 0.5) * Float(box.width)
                     midY = Float(box.minY) + Float((l.y + r.y) * 0.5) * Float(box.height)
+                } else if let nose {
+                    midX = Float(box.minX) + Float(nose.x) * Float(box.width)
+                    midY = Float(box.minY) + Float(nose.y) * Float(box.height)
                 }
             }
+            // Mirror selfie buffers (isVideoMirrored): face left of frame → negative yaw
+            // → left sprites. No blanket negate — right-side path already matched UX.
             var rawYaw = (midX - 0.5) * 2.6
             var rawPitch = (midY - 0.52) * 2.4
             rawYaw = max(-1, min(1, rawYaw))
             rawPitch = max(-1, min(1, rawPitch))
+            lastRawYaw = rawYaw
+            lastRawPitch = rawPitch
             publish(face: true, rawYaw: rawYaw, rawPitch: rawPitch)
         } catch {
-            publish(face: false, rawYaw: 0, rawPitch: 0)
+            publish(face: false, rawYaw: lastRawYaw, rawPitch: lastRawPitch)
         }
     }
 }

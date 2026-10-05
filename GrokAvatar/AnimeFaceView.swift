@@ -62,6 +62,44 @@ final class SpriteBank {
     func sprite(_ name: String) -> Sprite? { sprites[name] }
 }
 
+
+// MARK: - Viewer / window parallax
+
+/// Screen-space offset so eyes look toward the user (camera ≈ top-center of the display)
+/// when the floating window is dragged around. Returns yaw/pitch in −1…1 (same space as FaceTracker).
+enum ViewerParallax {
+    /// Gain: full travel from screen center to edge ≈ this fraction of max look.
+    private static let gainX: Float = 0.82
+    private static let gainY: Float = 0.70
+
+    static func offset(for window: NSWindow?) -> (yaw: Float, pitch: Float) {
+        guard let window else { return (0, 0) }
+        let frame = window.frame
+        let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return (0, 0) }
+        let sf = screen.frame
+        // Built-in MacBook camera sits at the top-center of the display bezel.
+        let camX = sf.midX
+        let camY = sf.maxY
+        // Positive deltaX → camera is to the right of the window → look right (positive yaw).
+        let dx = Float(camX - frame.midX)
+        let dy = Float(camY - frame.midY)
+        let halfW = Float(max(sf.width * 0.5, 1))
+        let halfH = Float(max(sf.height * 0.5, 1))
+        let yaw = max(-1, min(1, (dx / halfW) * gainX))
+        let pitch = max(-1, min(1, (dy / halfH) * gainY))
+        return (yaw, pitch)
+    }
+
+    /// Prefer the visible GrokAvatar window (floating avatar), else key window.
+    static func avatarWindow() -> NSWindow? {
+        if let w = NSApp.windows.first(where: { $0.isVisible && $0.frame.width >= 300 && $0.frame.height >= 300 }) {
+            return w
+        }
+        return NSApp.keyWindow ?? NSApp.windows.first
+    }
+}
+
 // MARK: - Frame selection (inputs → frame names, with hysteresis + short crossfade)
 
 final class SpriteDriver: ObservableObject {
@@ -77,7 +115,10 @@ final class SpriteDriver: ObservableObject {
     private static let lookBounds: [Float] = [-0.40, -0.24, -0.09, 0.09, 0.24, 0.40];  private static let lookHys: Float = 0.025
     private static let pitchBounds: [Float] = [-0.45, -0.28, -0.12, 0.12, 0.28, 0.45]; private static let pitchHys: Float = 0.03
     private static let blinkBounds: [Float] = [0.15, 0.38, 0.60, 0.82];                private static let blinkHys: Float = 0.03
-    private static let jawBounds: [Float] = [0.04, 0.10, 0.16, 0.23, 0.30, 0.38, 0.47]; private static let jawHys: Float = 0.015
+    // Quiet speech → o1–o2; mid o3–o4; loud o5–o7. High first tier so residual jaw never flaps o0.
+    private static let jawBounds: [Float] = [0.10, 0.18, 0.28, 0.38, 0.50, 0.62, 0.76]; private static let jawHys: Float = 0.025
+    /// Absolute closed-mouth clamp — below this SpriteDriver forces o0 regardless of hysteresis.
+    private static let jawClosedMax: Float = 0.06
 
     @Published private(set) var head = "center"
     @Published private(set) var eyes = "center"
@@ -97,10 +138,15 @@ final class SpriteDriver: ObservableObject {
     private var fadeStart: CFTimeInterval = 0
     private var fadeDur: CFTimeInterval = 0.1
 
-    // idle glances when no face is tracked (VN-style "alive" eyes)
+    // idle glances when no face is tracked AND window is near screen/camera (VN-style "alive" eyes)
     private var nextGlanceAt = CACurrentMediaTime() + 2.5
     private var glanceUntil: CFTimeInterval = 0
     private var glance = (x: 3, y: 3)
+
+    // Smoothed window→viewer parallax (keeps eyes on the user while dragging the window)
+    private var smoothWinYaw: Float = 0
+    private var smoothWinPitch: Float = 0
+    private let winEma: Float = 0.28
 
     func attach(engine: LipSyncEngine, tracker: FaceTracker) {
         self.engine = engine
@@ -136,21 +182,41 @@ final class SpriteDriver: ObservableObject {
         let now = CACurrentMediaTime()
         let w = engine.weights
 
-        yawIdx = Self.quantize(tracker.yaw, yawIdx, Self.yawBounds, Self.yawHys)
-        lookIdx = Self.quantize(tracker.yaw, lookIdx, Self.lookBounds, Self.lookHys)
-        pitchIdx = Self.quantize(tracker.pitch, pitchIdx, Self.pitchBounds, Self.pitchHys)
+        // Window position relative to estimated camera (top-center): eyes stay on the viewer.
+        let win = ViewerParallax.offset(for: ViewerParallax.avatarWindow())
+        smoothWinYaw += (win.yaw - smoothWinYaw) * winEma
+        smoothWinPitch += (win.pitch - smoothWinPitch) * winEma
+
+        // Eyes = face tracking + window parallax. Head leans only lightly with the window.
+        let eyeYaw = max(-1, min(1, tracker.yaw + smoothWinYaw))
+        let eyePitch = max(-1, min(1, tracker.pitch + smoothWinPitch))
+        let headYaw = max(-1, min(1, tracker.yaw + smoothWinYaw * 0.35))
+
+        yawIdx = Self.quantize(headYaw, yawIdx, Self.yawBounds, Self.yawHys)
+        lookIdx = Self.quantize(eyeYaw, lookIdx, Self.lookBounds, Self.lookHys)
+        pitchIdx = Self.quantize(eyePitch, pitchIdx, Self.pitchBounds, Self.pitchHys)
         blinkIdx = Self.quantize(w.eyeBlink, blinkIdx, Self.blinkBounds, Self.blinkHys)
-        jawIdx = Self.quantize(w.jawOpen, jawIdx, Self.jawBounds, Self.jawHys)
+        // Mouth ONLY follows real jawOpen from LipSyncEngine — never idle/random.
+        if w.jawOpen < Self.jawClosedMax {
+            jawIdx = 0
+        } else {
+            jawIdx = Self.quantize(w.jawOpen, jawIdx, Self.jawBounds, Self.jawHys)
+        }
 
         var gx = lookIdx, gy = pitchIdx
+        // When camera finds no face, window parallax still drives the eyes.
+        // Soft idle glances only when the window is near the camera (nearly frontal).
         if !tracker.faceDetected {
-            if now >= nextGlanceAt {
-                let options = [(2, 3), (1, 3), (0, 3), (4, 3), (5, 3), (6, 3), (3, 4), (3, 5), (3, 2), (2, 4), (4, 4)]
-                glance = options.randomElement() ?? (3, 3)
-                glanceUntil = now + Double.random(in: 0.7...1.3)
-                nextGlanceAt = now + Double.random(in: 3.0...6.0)
+            let nearFront = abs(smoothWinYaw) < 0.12 && abs(smoothWinPitch) < 0.12
+            if nearFront {
+                if now >= nextGlanceAt {
+                    let options = [(2, 3), (1, 3), (0, 3), (4, 3), (5, 3), (6, 3), (3, 4), (3, 5), (3, 2), (2, 4), (4, 4)]
+                    glance = options.randomElement() ?? (3, 3)
+                    glanceUntil = now + Double.random(in: 0.7...1.3)
+                    nextGlanceAt = now + Double.random(in: 3.0...6.0)
+                }
+                if now < glanceUntil { gx = glance.x; gy = glance.y }
             }
-            if now < glanceUntil { gx = glance.x; gy = glance.y }
         }
 
         let newHead = Self.heads[yawIdx]
@@ -163,18 +229,18 @@ final class SpriteDriver: ObservableObject {
 
         if newHead != head || newEyes != eyes || newMouth != mouth {
             if newHead != head || newEyes != eyes {
-                // freeze what is currently (mostly) visible as the underlay, fade the new frame in
-                if blend >= 0.5 { prevHead = head; prevEyes = eyes; prevMouth = mouth }
+                // Freeze head/eyes for crossfade only — mouth never participates in the blend
+                // (blending mouth_H1_o0 with mouth_H2_o0 ghosts a wider "talking" lip from the ~10px rect shift).
+                if blend >= 0.5 { prevHead = head; prevEyes = eyes }
                 fadeStart = now
                 let blinkish = newEyes.hasPrefix("blink") || newEyes == "closed" || eyes.hasPrefix("blink") || eyes == "closed"
                 fadeDur = blinkish ? 0.03 : (newHead != head ? 0.09 : 0.05)
                 blend = 0
-            } else if blend >= 1 {
-                prevMouth = newMouth   // mouth alone snaps (crisp VN lip flaps, 8 tiers)
             }
             head = newHead
             eyes = newEyes
             mouth = newMouth
+            prevMouth = newMouth  // mouth always snaps with current tier
         }
         if blend < 1 {
             blend = min(1, (now - fadeStart) / max(0.001, fadeDur))
@@ -209,16 +275,17 @@ struct AnimeFaceView: View {
                     if bank.sprites.isEmpty {
                         fallbackFace.frame(width: side, height: side)
                     } else {
+                        // Head + eyes crossfade only. Mouth is drawn once on top at full opacity
+                        // so head-turn blends cannot ghost two o0 crops into a "talking" mouth.
                         layer(driver.prevHeadFrame, k)
                         layer(driver.prevEyesFrame, k)
-                        layer(driver.prevMouthFrame, k)
                         ZStack(alignment: .topLeading) {
                             layer(driver.headFrame, k)
                             layer(driver.eyesFrame, k)
-                            layer(driver.mouthFrame, k)
                         }
                         .frame(width: side, height: side, alignment: .topLeading)
                         .opacity(driver.blend)
+                        layer(driver.mouthFrame, k)
                     }
                 }
                 .frame(width: side, height: side, alignment: .topLeading)

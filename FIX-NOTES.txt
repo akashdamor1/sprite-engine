@@ -1,6 +1,16 @@
-Lip-sync rebuild 2026-10-05:
-- Fixed SCStream PCM via CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer
-- jawGain 45, speakGate 0.0015; packetCount/rawRms/audioFlowing status
-- HeadRig: upper cranium + open mouth cavity (skull no longer hides jaw)
-- HeadSceneView: 60Hz unconditional apply
-- Build succeeded; launched pid via open
+Lip-sync fix 2026-10-06b (still-talking after DEMO disable):
+- Root A: AnimeFaceView head/eyes crossfade ALSO blended mouth_H1_* with mouth_H2_*.
+  Mouth rects shift ~10px per head yaw level; alpha-blending two o0 crops ghosts a
+  wider/open lip → looks like continuous talking while face-track/parallax jitters head,
+  even when LipSyncEngine jawOpen=0 (IDLE_NO_CAPTURE).
+  Fix: mouth drawn once on top at full opacity; never in head/eyes blend. Force jawIdx=0
+  when jawOpen < 0.06.
+- Root B: brief smoke still pulsed jaw with sin() for 0.55s — removed entirely.
+- Root C (when LIVE): speakGate 0.008 too low; prior session nonSilent≈almost all packets.
+  Fix: speakGate 0.022, openConfirmGate 0.030, 8-frame unlock, jawGain 12, adaptive
+  noiseFloor, hard jawEnv=0 when !speakingUnlocked.
+- Logs: MODE=LIVE vs IDLE_NO_CAPTURE; no SMOKE mode.
+
+Eye-track left-side fix 2026-10-06:
+- Cause: VNImageRequestHandler orientation .leftMirrored (iPhone portrait) on Mac landscape webcam dropped/skewed faces on one horizontal side; both-eyes-only landmark gate + zeroing on miss made left look freeze/decay while right stayed OK.
+- Fix: orientation .up; rectangles fallback; nose/box when one eye missing; hold last pose on miss; faceHold 0.55s. No blanket yaw negate (right already correct). Sprites/bounds were symmetric.

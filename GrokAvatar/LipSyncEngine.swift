@@ -4,7 +4,7 @@ import QuartzCore
 import AppKit
 
 /// Maps system-audio analysis to facial controls at ~60 Hz.
-/// Crude mode: any audio above threshold → jawOpen = 1.0, else 0 (verifies capture→apply).
+/// Idle stays mouth-closed (o0); opens only on sustained audio above noise floor.
 final class LipSyncEngine: ObservableObject {
     struct Weights: Equatable {
         var jawOpen: Float = 0
@@ -35,12 +35,25 @@ final class LipSyncEngine: ObservableObject {
     private var widthEnv: Float = 0.5
     private var widenEnv: Float = 0
 
-    // Crude binary threshold test (isolates capture vs apply)
-    private let crudeOpenThreshold: Float = 0.004
-    private let attack: Float = 0.42
-    private let release: Float = 0.38
-    private let jawGain: Float = 42.0
-    private let speakGate: Float = 0.0012
+    // Noise floor / gating — mouth opens only on clear speech, not ambient/fan/UI.
+    private let speakGate: Float = 0.022
+    /// Higher bar to *start* opening; once unlocked, speakGate holds it.
+    private let openConfirmGate: Float = 0.030
+    /// Frames (~60 Hz) above openConfirmGate required before mouth unlocks.
+    private let openHoldFrames: Int = 8
+    /// Asymmetric envelope: slower attack, fast release when quiet.
+    private let attack: Float = 0.22
+    private let release: Float = 0.70
+    private let quietRelease: Float = 0.88
+    /// Quiet speech → o1–o2; loud → o5–o7 (with SpriteDriver jawBounds).
+    private let jawGain: Float = 12.0
+    /// Slow adaptive floor from quiet packets; speak must clear floor*ratio too.
+    private var noiseFloor: Float = 0.004
+    private let noiseFloorAlpha: Float = 0.04
+    private let noiseFloorRatio: Float = 3.5
+
+    private var aboveGateFrames: Int = 0
+    private var speakingUnlocked = false
 
     private var nextBlinkAt = Date().addingTimeInterval(2.5)
     private var blinkPhase: Float = 0
@@ -54,18 +67,26 @@ final class LipSyncEngine: ObservableObject {
     private var warnedNoPackets = false
     private var lastLogAt: TimeInterval = 0
     private var nonSilentPackets: UInt64 = 0
+    private var loggedMode: String = ""
 
-    // Smoke-test: animate jaw on launch to prove SceneKit apply works
+    // Smoke / demo mouth wiggle permanently disabled — mouth stays o0 until real speech.
     private var smokeUntil: TimeInterval = 0
+    private let smokeDuration: TimeInterval = 0
 
     private let logURL = URL(fileURLWithPath: NSString("~/GrokAvatar/lip-sync-debug.log").expandingTildeInPath)
 
     func start() {
         guard !started else { return }
         started = true
-        smokeUntil = CACurrentMediaTime() + 3.0
+        smokeUntil = 0
         lastAudioTime = CACurrentMediaTime()
-        appendLog("engine start — smoke test 2s then live lip-sync")
+        aboveGateFrames = 0
+        speakingUnlocked = false
+        energyEnv = 0
+        jawEnv = 0
+        noiseFloor = 0.004
+        loggedMode = ""
+        appendLog("engine start — no smoke/demo; mouth o0 until speech above gate")
         startCapture()
         startTickTimer()
     }
@@ -95,6 +116,12 @@ final class LipSyncEngine: ObservableObject {
         NSLog("GrokAvatar LipSync: %@", line)
     }
 
+    private func logModeOnce(_ mode: String, detail: String) {
+        guard mode != loggedMode else { return }
+        loggedMode = mode
+        appendLog("MODE=\(mode) \(detail)")
+    }
+
     private func startCapture() {
         let cap = SystemAudioCapture { [weak self] analysis in
             guard let self else { return }
@@ -102,7 +129,7 @@ final class LipSyncEngine: ObservableObject {
             self.latest = analysis
             self.lastAudioTime = CACurrentMediaTime()
             self.localPacketCount &+= 1
-            if analysis.rms > 0.0008 { self.nonSilentPackets &+= 1 }
+            if analysis.rms > self.speakGate { self.nonSilentPackets &+= 1 }
             let pkts = self.localPacketCount
             let nons = self.nonSilentPackets
             let rms = analysis.rms
@@ -111,9 +138,8 @@ final class LipSyncEngine: ObservableObject {
                 self.packetCount = pkts
                 self.rawRms = rms
             }
-            // Throttled file log when non-silent
             let now = CACurrentMediaTime()
-            if rms > 0.0008, now - self.lastLogAt > 0.35 {
+            if rms > self.speakGate, now - self.lastLogAt > 0.35 {
                 self.lastLogAt = now
                 self.appendLog(String(format: "PCM rms=%.5f pkts=%llu nonSilent=%llu", rms, pkts, nons))
             }
@@ -125,12 +151,14 @@ final class LipSyncEngine: ObservableObject {
                 self.captureOK = true
                 self.captureStartedAt = CACurrentMediaTime()
                 self.warnedNoPackets = false
-                self.statusNote = "Capture OK · smoke then live"
-                self.appendLog("ScreenCaptureKit start OK")
+                self.statusNote = "Capture OK · listening"
+                self.appendLog("ScreenCaptureKit start OK — LIVE capture")
+                self.logModeOnce("LIVE", detail: "capture OK, waiting for packets")
             } catch {
                 self.captureOK = false
-                self.statusNote = "Grant Screen Recording — \(error.localizedDescription)"
+                self.statusNote = "Grant Screen Recording — mouth idle until live"
                 self.appendLog("capture FAIL: \(error.localizedDescription)")
+                self.logModeOnce("IDLE_NO_CAPTURE", detail: "Screen Recording denied/failed — mouth closed (no demo)")
             }
         }
     }
@@ -154,36 +182,21 @@ final class LipSyncEngine: ObservableObject {
         let a = latest
         let audioAgeMs = (CACurrentMediaTime() - lastAudioTime) * 1000
         let pkts = localPacketCount
-        let _ = nonSilentPackets
         lock.unlock()
 
         let now = CACurrentMediaTime()
 
-        // --- Launch smoke test: force jaw open/close so SceneKit path is proven ---
-        if now < smokeUntil && lipSyncEnabled {
-            let phase = (smokeUntil - now) / 3.0
-            // Gentle open/close so we can verify mouth lands on the painted lips
-            let pulse = Float(0.25 + 0.55 * abs(sin((1 - phase) * .pi * 5)))
-            updateBlink()
-            weights = Weights(jawOpen: pulse, mouthWidth: 0.6, eyeBlink: blinkAmount, eyeWiden: 0.1, energy: pulse)
-            statusNote = "SMOKE · mouth align check"
-            latencyMs = audioAgeMs
-            return
-        }
-
+        // Smoke disabled (smokeUntil always 0) — never synthesize jaw motion.
         if !lipSyncEnabled {
             updateBlink()
-            energyEnv = 0
-            jawEnv = 0
-            widthEnv = 0.5
-            widenEnv = 0
+            resetMouthEnvelopes()
             weights = Weights(jawOpen: 0, mouthWidth: 0.5, eyeBlink: blinkAmount, eyeWiden: 0, energy: 0)
             statusNote = "Lip sync OFF"
             latencyMs = audioAgeMs
             return
         }
 
-        // No live system audio yet (denied Screen Recording, or capture up but silent packets)
+        // No live system audio — keep mouth CLOSED (no continuous demo wiggle).
         if !captureOK || pkts == 0 {
             if captureOK {
                 let elapsed = now - captureStartedAt
@@ -191,51 +204,88 @@ final class LipSyncEngine: ObservableObject {
                     warnedNoPackets = true
                     statusNote = "No audio packets — enable Screen Recording for GrokAvatar, then relaunch"
                     appendLog("WATCHDOG: 0 packets after 2.5s — Screen Recording likely denied")
+                    logModeOnce("IDLE_NO_PACKETS", detail: "capture OK but 0 packets — mouth closed")
+                } else if elapsed <= 2.5 {
+                    statusNote = "Capture OK · waiting for audio…"
                 }
-            } else if !warnedNoPackets {
-                warnedNoPackets = true
-                appendLog("WATCHDOG: capture not OK — demo lips until Screen Recording allowed")
+            } else {
+                if !warnedNoPackets {
+                    warnedNoPackets = true
+                    appendLog("WATCHDOG: capture not OK — mouth idle (demo lips DISABLED)")
+                }
+                logModeOnce("IDLE_NO_CAPTURE", detail: "demo lips disabled — grant Screen Recording for live sync")
+                statusNote = "Idle · grant Screen Recording for live lip-sync"
             }
-            // Demo speech-like mouth until Screen Recording grants live audio
             updateBlink()
-            let syllable = abs(sin(now * 7.2)) * abs(sin(now * 3.1))
-            let demo = Float(0.08 + 0.52 * Float(syllable))
-            jawEnv = demo
-            weights = Weights(jawOpen: demo, mouthWidth: 0.6, eyeBlink: blinkAmount, eyeWiden: 0.05, energy: demo * 0.02)
-            statusNote = "DEMO lips (grant Screen Recording for live sync)"
+            resetMouthEnvelopes()
+            weights = Weights(jawOpen: 0, mouthWidth: 0.5, eyeBlink: blinkAmount, eyeWiden: 0, energy: 0)
             latencyMs = audioAgeMs
             return
         }
 
+        let effectiveGate = max(speakGate, noiseFloor * noiseFloorRatio)
+        let effectiveConfirm = max(openConfirmGate, effectiveGate * 1.25)
+        logModeOnce("LIVE", detail: String(format: "pkts=%llu gate=%.4f floor=%.5f", pkts, effectiveGate, noiseFloor))
+
         let raw = a.rms
+        // Adaptive noise floor: only learn from clearly quiet packets.
+        if raw < speakGate * 0.85 {
+            noiseFloor += (raw - noiseFloor) * noiseFloorAlpha
+            noiseFloor = max(0.001, min(noiseFloor, speakGate * 0.7))
+        }
+
         if raw > energyEnv {
             energyEnv += (raw - energyEnv) * attack
         } else {
             energyEnv += (raw - energyEnv) * release
         }
 
-        // Proportional jaw from energy (speech-like), with a soft boost when clearly speaking
-        let gated = max(0, energyEnv - speakGate)
-        var jawTarget = min(1, gated * jawGain)
-        if energyEnv >= crudeOpenThreshold {
-            jawTarget = max(jawTarget, min(0.85, energyEnv * 90))
+        // Sustained-audio unlock: several frames above confirm gate (speech, not blips).
+        if energyEnv >= effectiveConfirm {
+            aboveGateFrames = min(openHoldFrames + 2, aboveGateFrames + 1)
+            if aboveGateFrames >= openHoldFrames {
+                speakingUnlocked = true
+            }
+        } else if energyEnv < effectiveGate {
+            aboveGateFrames = 0
+            speakingUnlocked = false
+        } else {
+            aboveGateFrames = max(0, aboveGateFrames - 1)
+            if aboveGateFrames == 0 { speakingUnlocked = false }
+        }
+
+        var jawTarget: Float = 0
+        if speakingUnlocked {
+            let gated = max(0, energyEnv - effectiveGate)
+            jawTarget = min(1, gated * jawGain)
+            if energyEnv >= 0.055 {
+                jawTarget = max(jawTarget, min(1.0, (energyEnv - 0.035) * 16))
+            }
         }
 
         if jawTarget > jawEnv {
             jawEnv += (jawTarget - jawEnv) * attack
         } else {
-            let rel = energyEnv < speakGate ? max(release, 0.5) : release
+            let rel = energyEnv < effectiveGate ? quietRelease : release
             jawEnv += (jawTarget - jawEnv) * rel
         }
-        if energyEnv < speakGate { jawEnv *= 0.82 }
+        // Hard close whenever not unlocked or below gate — no residual jaw wiggle.
+        if !speakingUnlocked || energyEnv < effectiveGate {
+            jawEnv = 0
+            widthEnv = 0.5
+            widenEnv = 0
+        } else if jawEnv < 0.03 {
+            jawEnv = 0
+        }
 
         let bandSum = a.mid + a.high + 1e-6
         let highRatio = a.high / bandSum
-        let widthTarget: Float = gated < 0.001 ? 0.5 : (0.75 - highRatio * 0.55)
-        widthEnv += (widthTarget - widthEnv) * 0.25
-
-        let widenTarget: Float = energyEnv > 0.045 ? min(1, (energyEnv - 0.045) * 12) : 0
-        widenEnv += (widenTarget - widenEnv) * 0.3
+        let widthTarget: Float = jawTarget < 0.05 ? 0.5 : (0.75 - highRatio * 0.55)
+        if speakingUnlocked {
+            widthEnv += (widthTarget - widthEnv) * 0.25
+            let widenTarget: Float = energyEnv > 0.06 ? min(1, (energyEnv - 0.06) * 10) : 0
+            widenEnv += (widenTarget - widenEnv) * 0.3
+        }
 
         updateBlink()
 
@@ -246,16 +296,23 @@ final class LipSyncEngine: ObservableObject {
             eyeWiden: widenEnv,
             energy: energyEnv
         )
-        weights = w // always publish so SceneKit apply never stalls on Equatable
+        weights = w
         latencyMs = audioAgeMs
 
-        if captureOK && pkts > 0 {
-            if jawEnv > 0.12 {
-                statusNote = String(format: "Talking · rms %.4f · jaw %.2f · pkts %llu", energyEnv, jawEnv, pkts)
-            } else {
-                statusNote = String(format: "Idle · rms %.4f · pkts %llu · listening", energyEnv, pkts)
-            }
+        if jawEnv > 0.08 {
+            statusNote = String(format: "LIVE · Talking · rms %.4f · jaw %.2f · pkts %llu", energyEnv, jawEnv, pkts)
+        } else {
+            statusNote = String(format: "LIVE · Idle · rms %.4f · floor %.4f · pkts %llu", energyEnv, noiseFloor, pkts)
         }
+    }
+
+    private func resetMouthEnvelopes() {
+        energyEnv = 0
+        jawEnv = 0
+        widthEnv = 0.5
+        widenEnv = 0
+        aboveGateFrames = 0
+        speakingUnlocked = false
     }
 
     private func updateBlink() {

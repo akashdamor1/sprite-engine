@@ -135,7 +135,11 @@ struct HeadSceneView: NSViewRepresentable {
                     if self.blinkAmount < 0.02 { self.blinkAmount = 0 }
                 }
                 let idle = HeadRig.IdleExtras(breath: breath, blink: self.blinkAmount)
-                let gaze = Gaze(lookX: tracker.yaw, lookY: tracker.pitch)
+                // Combine face tracking with window→viewer parallax (same helper as AnimeFaceView).
+                let win = ViewerParallax.offset(for: ViewerParallax.avatarWindow())
+                let lookX = max(-1, min(1, tracker.yaw + win.yaw))
+                let lookY = max(-1, min(1, tracker.pitch + win.pitch))
+                let gaze = Gaze(lookX: lookX, lookY: lookY)
                 self.rig.apply(self.engine.weights, gaze: gaze, idle: idle)
 
                 // Head: face tracking overrides; else idle micro tilts/nods
